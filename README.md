@@ -31,7 +31,7 @@ the dependencies:
 
 While in the `gatekeeper` directory, run the setup script:
 
-    $ ./setup.sh
+    $ . setup.sh
 
 This script compiles DPDK and LuaJIT, and loads the needed kernel modules.
 Additionally, it saves the interface names and their respective PCI addresses
