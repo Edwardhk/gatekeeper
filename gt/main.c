@@ -15,13 +15,13 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
 #include <stdbool.h>
 #include <arpa/inet.h>
 #include <lualib.h>
 #include <lauxlib.h>
 #include <netinet/ip.h>
 #include <math.h>
+#include <string.h>
 
 #include <rte_log.h>
 #include <rte_ether.h>
@@ -30,6 +30,9 @@
 #include <rte_random.h>
 #include <rte_cycles.h>
 #include <rte_common.h>
+
+#include <openssl/rsa.h>
+#include <openssl/pem.h>
 
 #include "gatekeeper_fib.h"
 #include "gatekeeper_lls.h"
@@ -48,6 +51,77 @@
 /* TODO Get the install-path via Makefile. */
 #define LUA_POLICY_BASE_DIR "./lua"
 #define GRANTOR_CONFIG_FILE "policy.lua"
+
+static RSA*
+generate_rsa(RSA* rsa, const int kBits){
+	unsigned long e = RSA_F4;
+	BIGNUM* bignum = BN_new();
+	if(BN_set_word(bignum, e))
+		printf("[Debug] BIGNUM allocated!\n");
+	else
+		printf("[Debug] BIGNUM NOT allocated!\n");
+
+	if(RSA_generate_key_ex(rsa, kBits, bignum, NULL))
+		printf("[Debug] RSA allocated!\n");
+	else
+		printf("[Debug] RSA NOT allocated!\n");
+
+	BN_free(bignum);
+	return rsa;
+}
+
+static bool
+rsa_sign(RSA* rsa, unsigned char* Msg,
+	      size_t MsgLen, unsigned char** EncMsg,
+	      size_t* MsgLenEnc){
+	EVP_MD_CTX* m_RSASignCtx = EVP_MD_CTX_create();
+	EVP_PKEY* priKey  = EVP_PKEY_new();
+	EVP_PKEY_assign_RSA(priKey, rsa);
+
+	if (EVP_DigestSignInit(m_RSASignCtx,NULL, EVP_sha256(), NULL,priKey) <= 0)
+  		return false;
+	if (EVP_DigestSignUpdate(m_RSASignCtx, Msg, MsgLen) <= 0)
+		return false;
+	if (EVP_DigestSignFinal(m_RSASignCtx, NULL, MsgLenEnc) <= 0)
+		return false;
+
+	*EncMsg = (unsigned char*)malloc(*MsgLenEnc);
+	if (EVP_DigestSignFinal(m_RSASignCtx, *EncMsg, MsgLenEnc) <= 0)
+		return false;
+	EVP_MD_CTX_cleanup(m_RSASignCtx);
+
+	return true;
+}
+
+static void
+base_64_encode(const unsigned char* b64_input, size_t length,
+                   char** b64_output){
+	BIO *bio, *b64;
+	BUF_MEM *bufferPtr;
+	b64 = BIO_new(BIO_f_base64());
+	bio = BIO_new(BIO_s_mem());
+	bio = BIO_push(b64, bio);
+	BIO_write(bio, b64_input, length);
+	BIO_flush(bio);
+	BIO_get_mem_ptr(bio, &bufferPtr);
+	BIO_set_close(bio, BIO_NOCLOSE);
+	BIO_free_all(bio);
+	*b64_output=(*bufferPtr).data;
+}
+
+static char*
+write_rsa_to_char(RSA* rsa){
+	char* pem_key;
+	int keylen;
+
+	BIO *bio = BIO_new(BIO_s_mem());
+	PEM_write_bio_RSAPrivateKey(bio, rsa, NULL, NULL, 0, NULL, NULL);
+	keylen = BIO_pending(bio);
+	pem_key = calloc(keylen+1, 1); /* Null-terminate */
+	BIO_read(bio, pem_key, keylen);
+
+	return pem_key;
+}
 
 static int
 get_block_idx(struct gt_config *gt_conf, unsigned int lcore_id)
@@ -665,6 +739,18 @@ static struct rte_mbuf *
 alloc_and_fill_notify_pkt(unsigned int socket, struct ggu_policy *policy,
 	struct gt_packet_headers *pkt_info, struct gt_config *gt_conf)
 {
+	// Generate RSA* rsa
+	char *pem_key;
+	const int kBits = 2048;
+	RSA *rsa = RSA_new();
+	rsa = generate_rsa(rsa, kBits);
+
+	// Generate char* pem_key using RSA* rsa
+	pem_key = write_rsa_to_char(rsa);
+
+	// Print the private key generated
+	printf("[Debug] Private key generated as: \n%s\n", pem_key);
+
 	uint8_t *data;
 	uint16_t ethertype = pkt_info->outer_ethertype;
 	struct ether_hdr *notify_eth;
@@ -673,6 +759,8 @@ alloc_and_fill_notify_pkt(unsigned int socket, struct ggu_policy *policy,
 	struct udp_hdr *notify_udp;
 	struct ggu_common_hdr *notify_ggu;
 	size_t l2_len;
+
+
 
 	struct rte_mbuf *notify_pkt = rte_pktmbuf_alloc(
 		gt_conf->net->gatekeeper_pktmbuf_pool[socket]);
@@ -717,6 +805,7 @@ alloc_and_fill_notify_pkt(unsigned int socket, struct ggu_policy *policy,
 		rte_memcpy(data + sizeof(policy->flow.f.v4),
 			&policy->params.u.declined,
 			sizeof(policy->params.u.declined));
+
 	} else if (policy->flow.proto == ETHER_TYPE_IPv6
 			&& policy->state == GK_DECLINED) {
 		notify_ggu->n2 = 1;
@@ -753,6 +842,23 @@ alloc_and_fill_notify_pkt(unsigned int socket, struct ggu_policy *policy,
 	} else
 		rte_panic("Unexpected condition: gt fills up a notify packet with unexpected policy state %u\n",
 			policy->state);
+	
+ 	// Create a plain text input for testing
+	unsigned char* plain_text_input = NULL;
+	size_t plain_text_input_len;
+	plain_text_input_len = strlen((char*) plain_text_input);
+	strncpy((char*) plain_text_input, "GK_GRANTED", 10);
+	printf("[Debug] Message before sign: \n%s\n\n", plain_text_input);
+	
+	// Sign the message with RSA generated and store in b64_input
+ 	unsigned char* b64_input = NULL;
+	size_t b64_input_len;
+	char* b64_output; // Encode the b64_input produced by rsa_sign
+	
+	rsa_sign(rsa, plain_text_input, plain_text_input_len, &b64_input, &b64_input_len);
+	//printf("[Debug] Message after REAL KEY sign: \n%s\n\n", b64_input);
+	base_64_encode(b64_input, b64_input_len, &b64_output);
+	printf("[Debug] Message after REAL KEY sign (base_64 encoded): \n%s\n\n", b64_output);
 
 	/* Fill up the link-layer header. */
 	fill_eth_hdr_reverse(&gt_conf->net->front, notify_eth, pkt_info);
@@ -1021,7 +1127,7 @@ gt_proc(void *arg)
 			 * with capabilities about to expire go through a
 			 * policy decision.
 			 *
-			 * Other packets will be fowarded directly.
+			 * Other packets will be forwarded directly.
 			 */
 			ret = gt_parse_incoming_pkt(m, &pkt_info);
 			if (ret < 0) {
